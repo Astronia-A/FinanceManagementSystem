@@ -17,16 +17,13 @@ from ai_engine import init_knowledge_base, get_financial_analysis
 # --- 0. 数据库管理 ---
 DB_FILE = 'finance_system.db'
 
-
 def make_hash(password):
     """将明文密码转化为 SHA-256 哈希值"""
     return hashlib.sha256(password.encode()).hexdigest()
 
-
 def check_password(password, hashed_password):
     """验证输入的密码是否正确"""
     return make_hash(password) == hashed_password
-
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -71,7 +68,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def load_data_from_db():
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT * FROM records", conn)
@@ -82,7 +78,6 @@ def load_data_from_db():
                  'operator': '操作人'})
     return df
 
-
 def insert_record(item, date, amount, operator):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -92,14 +87,12 @@ def insert_record(item, date, amount, operator):
     conn.commit()
     conn.close()
 
-
 def delete_record(record_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM records WHERE id = ?", (record_id,))
     conn.commit()
     conn.close()
-
 
 def insert_batch_from_excel(df_excel, operator):
     conn = sqlite3.connect(DB_FILE)
@@ -111,8 +104,6 @@ def insert_batch_from_excel(df_excel, operator):
     conn.commit()
     conn.close()
 
-
-# 新增：验证用户登录的函数
 def verify_login(username, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -127,7 +118,6 @@ def verify_login(username, password):
             return True
     return False
 
-
 # --- 辅助函数 ---
 def format_big_number(num):
     abs_num = abs(num)
@@ -138,14 +128,12 @@ def format_big_number(num):
     else:
         return f"¥{num:,.2f}"
 
-
 def generate_captcha_image():
     image = ImageCaptcha(width=200, height=60)
     captcha_text = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     data = image.generate(captcha_text)
     print(f"🔑 [DEBUG] 验证码: {captcha_text}")
     return captcha_text, data
-
 
 # --- 程序配置 ---
 st.set_page_config(page_title="智财云 Dashboard", layout="wide", page_icon="💰")
@@ -204,7 +192,7 @@ def main_app():
         st.title(f"👤 {st.session_state.username}")
         st.caption("财务管理员")
         st.divider()
-        menu = st.radio("系统导航", ["📊 经营仪表盘", "📝 数据录入管理", "🤖 AI 深度分析", "⚙️ 知识库设置"])
+        menu = st.radio("系统导航", ["📊 经营仪表盘", "📝 数据录入管理", "🤖 AI 深度分析", "⚙️ 知识库设置", "⚔️ 模型竞技场"])
         st.divider()
         if st.button("退出系统"):
             st.session_state.logged_in = False
