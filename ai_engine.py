@@ -8,25 +8,14 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
-# 1. 设置模型 (核心修改：增加 timeout 时间)
-# num_ctx=4096 增加上下文窗口，防止数据多了记不住
-# timeout=300 设置超时为 300秒 (5分钟)，给 AI 足够的思考时间
-llm = OllamaLLM(
-    model="llama3.2",
-    base_url="http://127.0.0.1:11434",
-    num_ctx=4096,
-    timeout=300
-)
 
 embeddings = OllamaEmbeddings(
     model="nomic-embed-text",
     base_url="http://127.0.0.1:11434",
 )
 
-# 全局变量
 vector_store = None
 DB_PATH = "faiss_index"
-
 
 def init_knowledge_base(file_path):
     global vector_store
@@ -73,7 +62,6 @@ def init_knowledge_base(file_path):
     except Exception as e:
         print(f"❌ 建立索引失败: {e}")
 
-
 def load_existing_db():
     global vector_store
     if os.path.exists(DB_PATH):
@@ -83,11 +71,19 @@ def load_existing_db():
         except:
             pass
 
-
-def get_financial_analysis(data_summary):
+def get_financial_analysis(data_summary, model_name="llama3.2"):
+    """支持传入 model_name"""
     global vector_store
     if not vector_store: load_existing_db()
-    if not vector_store: return "⚠️ 错误：请先在左侧上传并加载知识库文件！"
+    if not vector_store: return "⚠️ 错误：请先加载知识库！"
+
+    # 动态创建 LLM 对象
+    current_llm = OllamaLLM(
+        model=model_name,
+        base_url="http://127.0.0.1:11434",
+        num_ctx=4096,
+        timeout=300
+    )
 
     retriever = vector_store.as_retriever()
 
@@ -100,15 +96,77 @@ def get_financial_analysis(data_summary):
     【财务数据】:
     {input}
 
-    请简明扼要地给出分析意见（中文）：
+    请简明扼要地给出分析意见（必须用中文回答）：
     """)
 
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    question_answer_chain = create_stuff_documents_chain(current_llm, prompt)
     rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
+    start_time = time.time()  # 开始计时
     try:
-        # 这里 invoke 可能会比较慢，已在上面设置了 timeout
         response = rag_chain.invoke({"input": data_summary})
-        return response["answer"]
+        end_time = time.time()  # 结束计时
+        duration = round(end_time - start_time, 2)
+        return response["answer"], duration
     except Exception as e:
-        return f"分析中断: {e} (请检查 Ollama 是否运行或显存是否足够)"
+        return f"分析错误: {e}", 0
+
+def calculate_similarity_score(text1, text2):
+    """
+    计算两段文本的语义相似度 (余弦相似度)
+    返回 0.0 ~ 1.0 的分值，越高越好
+    """
+    if not text1 or not text2:
+        return 0.0
+
+    # 1. 把文字变成向量 (使用已加载的 embeddings 模型)
+    # 这就是 RAG 的核心技术，现在拿来做评测
+    vec1 = embeddings.embed_query(text1)
+    vec2 = embeddings.embed_query(text2)
+
+    # 2. 转换为 numpy 数组
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+
+    # 3. 计算余弦相似度公式: (A . B) / (|A| * |B|)
+    dot_product = np.dot(v1, v2)
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0.0
+
+    similarity = dot_product / (norm_v1 * norm_v2)
+    return round(float(similarity), 4)  # 保留4位小数
+
+# 修改 get_financial_analysis 支持动态换模型
+def get_financial_analysis_with_model(data_summary, model_name):
+    """支持指定模型的分析函数"""
+    global vector_store
+    if not vector_store: load_existing_db()
+    if not vector_store: return "知识库未加载", 0
+
+    # 动态创建指定模型
+    temp_llm = OllamaLLM(
+        model=model_name,
+        base_url="http://127.0.0.1:11434",
+        num_ctx=4096,
+        timeout=300
+    )
+
+    retriever = vector_store.as_retriever()
+    prompt = ChatPromptTemplate.from_template("""
+    你是一位专业的财务顾问。基于以下信息分析财务状况：
+    【背景知识】:{context}
+    【财务数据】:{input}
+    请用中文简要分析：
+    """)
+    chain = create_retrieval_chain(retriever, create_stuff_documents_chain(temp_llm, prompt))
+
+    start_time = time.time()
+    try:
+        res = chain.invoke({"input": data_summary})
+        duration = time.time() - start_time
+        return res["answer"], round(duration, 2)
+    except Exception as e:
+        return f"Error: {str(e)}", 0
