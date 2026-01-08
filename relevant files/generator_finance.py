@@ -12,8 +12,8 @@ def generate_account_excel(filename="account.xlsx"):
     ws.append(["项目", "日期", "金额"])
 
     # 日期范围
-    start_date = date(2025, 1, 1)
-    end_date = date(2025, 6, 30)
+    start_date = date(2024, 1, 1)
+    end_date = date(2025, 12, 31)
 
     # 收入 / 支出项目
     income_projects = [

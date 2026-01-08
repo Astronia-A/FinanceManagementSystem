@@ -1,5 +1,6 @@
 import os
 import time
+import numpy as np
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -8,6 +9,16 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
+# --- 1. 模型配置 ---
+llm = OllamaLLM(
+    model="llama3.2",
+    base_url="http://127.0.0.1:11434",
+    num_ctx=4096,
+    # 【修改1】超时时间设为无限长或非常长，防止加载模型时报错
+    timeout=600,
+    # 【修改2】告诉 Ollama：加载进内存后，至少保持 1小时(60m) 不退场
+    keep_alive="60m"
+)
 
 embeddings = OllamaEmbeddings(
     model="nomic-embed-text",
@@ -15,11 +26,12 @@ embeddings = OllamaEmbeddings(
 )
 
 vector_store = None
-DB_PATH = "faiss_index"
+DB_PATH = os.path.join(os.getcwd(), "faiss_index")
+
 
 def init_knowledge_base(file_path):
     global vector_store
-    print(f"📂 加载知识库: {file_path}")
+    print(f"📂 正在加载知识库文件: {file_path}")
     docs = []
     try:
         if file_path.endswith('.pdf'):
@@ -33,18 +45,18 @@ def init_knowledge_base(file_path):
                 loader = TextLoader(file_path, encoding='gbk')
                 docs = loader.load()
         else:
+            print("❌ 不支持的文件格式")
             return
     except Exception as e:
-        print(f"❌ 读取失败: {e}")
+        print(f"❌ 读取文件失败: {e}")
         return
 
     if not docs: return
 
-    # 切片逻辑
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=20)
     splits = text_splitter.split_documents(docs)
 
-    print(f"🧩 共 {len(splits)} 个片段，正在建立索引...")
+    print(f"🧩 切分完成，共 {len(splits)} 个片段。正在建立索引...")
 
     try:
         batch_size = 10
@@ -55,98 +67,93 @@ def init_knowledge_base(file_path):
                 vector_store = FAISS.from_documents(batch, embeddings)
             else:
                 vector_store.add_documents(batch)
-            time.sleep(0.1)  # 稍微快一点点
-
+            time.sleep(0.1)
         vector_store.save_local(DB_PATH)
-        print(f"✅ 知识库加载完毕！")
+        print(f"✅ 知识库加载完毕并已保存到 '{DB_PATH}'！")
     except Exception as e:
-        print(f"❌ 建立索引失败: {e}")
+        print(f"❌ 建立向量索引失败: {e}")
+
 
 def load_existing_db():
     global vector_store
     if os.path.exists(DB_PATH):
         try:
             vector_store = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-            print("✅ 已加载旧知识库")
         except:
             pass
 
-def get_financial_analysis(data_summary, model_name="llama3.2"):
-    """支持传入 model_name"""
-    global vector_store
-    if not vector_store: load_existing_db()
-    if not vector_store: return "⚠️ 错误：请先加载知识库！"
 
-    # 动态创建 LLM 对象
-    current_llm = OllamaLLM(
-        model=model_name,
-        base_url="http://127.0.0.1:11434",
-        num_ctx=4096,
-        timeout=300
-    )
+# --- 2. 核心修改点：强化的 Prompt ---
+STRONG_PROMPT = """
+你是一位专业的财务审计师。请务必遵守以下指令：
+
+1. 【核心任务】：你的唯一任务是分析下面的【财务数据摘要】。
+2. 【辅助参考】：【参考知识库】仅作为判断标准（例如，如果知识库说亏损不好，你就依据这个来批评数据）。
+3. 【禁止项】：绝对不要总结或评价知识库本身！不要说“这段文字介绍了...”之类的话。
+
+【参考知识库】(理论依据):
+{context}
+
+【财务数据摘要】(请重点分析这里的数据):
+{input}
+
+请直接输出针对数据的分析结论（用中文）：
+"""
+
+
+def get_financial_analysis(data_summary):
+    global vector_store
+
+    # 内存没有就读硬盘
+    if vector_store is None:
+        load_existing_db()
+    if vector_store is None:
+        return "⚠️ 错误：请先在左侧上传并加载知识库文件！"
 
     retriever = vector_store.as_retriever()
-
-    prompt = ChatPromptTemplate.from_template("""
-    你是一位专业的财务顾问。请基于【背景知识】分析【财务数据】。
-
-    【背景知识】:
-    {context}
-
-    【财务数据】:
-    {input}
-
-    请简明扼要地给出分析意见（必须用中文回答）：
-    """)
-
-    question_answer_chain = create_stuff_documents_chain(current_llm, prompt)
+    prompt = ChatPromptTemplate.from_template(STRONG_PROMPT)
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
     rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
-    start_time = time.time()  # 开始计时
-    try:
-        response = rag_chain.invoke({"input": data_summary})
-        end_time = time.time()  # 结束计时
-        duration = round(end_time - start_time, 2)
-        return response["answer"], duration
-    except Exception as e:
-        return f"分析错误: {e}", 0
+    # === 【修改3】 增加“自动重试”机制 ===
+    # 如果第一次连不上（因为模型在加载），就等2秒再试一次，最多试3次
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 正在尝试第 {attempt + 1} 次请求 AI...")
+            response = rag_chain.invoke({"input": data_summary})
+            return response["answer"]
+        except Exception as e:
+            error_msg = str(e)
+            print(f"⚠️ 第 {attempt + 1} 次请求失败: {error_msg}")
+
+            # 如果是连接错误，等待模型加载
+            if "Connection" in error_msg or "disconnected" in error_msg:
+                time.sleep(2)  # 等2秒让 Ollama 喘口气
+            else:
+                return f"分析过程发生严重错误: {e}"
+
+    return "❌ 连接 Ollama 失败，请检查后台服务是否开启，或者电脑是否卡顿。"
+
 
 def calculate_similarity_score(text1, text2):
-    """
-    计算两段文本的语义相似度 (余弦相似度)
-    返回 0.0 ~ 1.0 的分值，越高越好
-    """
-    if not text1 or not text2:
+    if not text1 or not text2: return 0.0
+    try:
+        vec1 = np.array(embeddings.embed_query(text1))
+        vec2 = np.array(embeddings.embed_query(text2))
+        dot = np.dot(vec1, vec2)
+        norm = np.linalg.norm(vec1) * np.linalg.norm(vec2)
+        if norm == 0: return 0.0
+        return round(float(dot / norm), 4)
+    except:
         return 0.0
 
-    # 1. 把文字变成向量 (使用已加载的 embeddings 模型)
-    # 这就是 RAG 的核心技术，现在拿来做评测
-    vec1 = embeddings.embed_query(text1)
-    vec2 = embeddings.embed_query(text2)
 
-    # 2. 转换为 numpy 数组
-    v1 = np.array(vec1)
-    v2 = np.array(vec2)
-
-    # 3. 计算余弦相似度公式: (A . B) / (|A| * |B|)
-    dot_product = np.dot(v1, v2)
-    norm_v1 = np.linalg.norm(v1)
-    norm_v2 = np.linalg.norm(v2)
-
-    if norm_v1 == 0 or norm_v2 == 0:
-        return 0.0
-
-    similarity = dot_product / (norm_v1 * norm_v2)
-    return round(float(similarity), 4)  # 保留4位小数
-
-# 修改 get_financial_analysis 支持动态换模型
 def get_financial_analysis_with_model(data_summary, model_name):
-    """支持指定模型的分析函数"""
+    """竞技场使用的函数"""
     global vector_store
     if not vector_store: load_existing_db()
-    if not vector_store: return "知识库未加载", 0
 
-    # 动态创建指定模型
     temp_llm = OllamaLLM(
         model=model_name,
         base_url="http://127.0.0.1:11434",
@@ -154,18 +161,20 @@ def get_financial_analysis_with_model(data_summary, model_name):
         timeout=300
     )
 
-    retriever = vector_store.as_retriever()
-    prompt = ChatPromptTemplate.from_template("""
-    你是一位专业的财务顾问。基于以下信息分析财务状况：
-    【背景知识】:{context}
-    【财务数据】:{input}
-    请用中文简要分析：
-    """)
-    chain = create_retrieval_chain(retriever, create_stuff_documents_chain(temp_llm, prompt))
+    retriever = vector_store.as_retriever() if vector_store else None
+
+    # 竞技场也使用强化后的 Prompt，保证公平
+    prompt = ChatPromptTemplate.from_template(STRONG_PROMPT)
+
+    if retriever:
+        chain = create_retrieval_chain(retriever, create_stuff_documents_chain(temp_llm, prompt))
+        input_data = {"input": data_summary}
+    else:
+        return "请先加载知识库", 0
 
     start_time = time.time()
     try:
-        res = chain.invoke({"input": data_summary})
+        res = chain.invoke(input_data)
         duration = time.time() - start_time
         return res["answer"], round(duration, 2)
     except Exception as e:
